@@ -2,17 +2,22 @@
 
 import asyncio
 import json
+import re
 import sys
 from pathlib import Path
 
 import pytest
 
 from fx_audit_mcp.browser_evaluator import (
+    _BASELINE_PREFS,
     MAX_LOG_SIZE,
+    MAX_MARKERS,
     _collect_dump_files,
     _crashed_parent,
     _extract_crash_pid,
+    _extract_markers,
     _load_ignored_signatures,
+    _merged_prefs,
     browser_evaluator,
     package_testcase,
     read_grizzly_logs,
@@ -125,6 +130,94 @@ class TestBrowserEvaluator:
                 filename="test.html",
                 firefox_binary=tmp_path / "no_firefox",
             )
+
+    @pytest.mark.anyio
+    async def test_invalid_marker_regex_fails_fast(self, tmp_path: Path) -> None:
+        """Verify an invalid marker_regex raises before launching Firefox."""
+        binary = tmp_path / "firefox"
+        binary.touch()
+        with pytest.raises(re.error):
+            await browser_evaluator(
+                content="<html></html>",
+                filename="test.html",
+                firefox_binary=binary,
+                marker_regex="(unclosed",
+            )
+
+
+class TestMergedPrefs:
+    def test_baseline_only(self) -> None:
+        """Without sites or caller prefs, only the baseline is returned."""
+        merged = _merged_prefs(None, None)
+        assert merged == _BASELINE_PREFS
+        assert merged is not _BASELINE_PREFS
+
+    def test_sites_defaults_and_pac_injected(self) -> None:
+        """A PAC URL adds the http-friendly sites defaults and the PAC pref."""
+        merged = _merged_prefs(None, "data:,pac")
+        assert merged["dom.security.https_first"] is False
+        assert merged["dom.disable_open_during_load"] is False
+        assert merged["network.proxy.autoconfig_url"] == "data:,pac"
+
+    def test_no_sites_prefs_without_pac(self) -> None:
+        """Sites defaults are not applied when hosting is inactive."""
+        merged = _merged_prefs({"foo.bar": 1}, None)
+        assert "dom.security.https_first" not in merged
+        assert "network.proxy.autoconfig_url" not in merged
+        assert merged["foo.bar"] == 1
+
+    def test_caller_overrides_sites_defaults_but_not_pac(self) -> None:
+        """Caller prefs beat the sites defaults; the PAC always wins."""
+        merged = _merged_prefs(
+            {
+                "dom.security.https_first": True,
+                "network.proxy.autoconfig_url": "stale-pac",
+            },
+            "data:,pac",
+        )
+        assert merged["dom.security.https_first"] is True
+        assert merged["network.proxy.autoconfig_url"] == "data:,pac"
+
+    def test_baseline_not_mutated_by_caller_prefs(self) -> None:
+        """Overriding a baseline pref must not mutate the module constant."""
+        merged = _merged_prefs({"browser.backup.enabled": True}, None)
+        assert merged["browser.backup.enabled"] is True
+        assert _BASELINE_PREFS["browser.backup.enabled"] is False
+
+
+class TestExtractMarkers:
+    def test_none_pattern_returns_none(self) -> None:
+        """Return None when no marker pattern was requested."""
+        logs = Logs(stderr="IPDLVERIFY x", stdout="")
+        assert _extract_markers(logs, None) is None
+
+    def test_matches_stderr_before_stdout(self) -> None:
+        """Matching lines are returned in order, stderr before stdout."""
+        logs = Logs(
+            stderr="noise\nIPDLVERIFY step=1\nmore noise",
+            stdout="IPDLVERIFY step=2\nnoise",
+        )
+        assert _extract_markers(logs, re.compile(r"^IPDLVERIFY ")) == [
+            "IPDLVERIFY step=1",
+            "IPDLVERIFY step=2",
+        ]
+
+    def test_no_match_returns_empty_list(self) -> None:
+        """An empty list distinguishes no-matches from not-requested."""
+        logs = Logs(stderr="noise", stdout="noise")
+        assert _extract_markers(logs, re.compile("IPDLVERIFY")) == []
+
+    def test_capped_with_truncation_sentinel(self) -> None:
+        """Verify marker lists are capped and report the omitted count."""
+        logs = Logs(
+            stderr="\n".join(f"MARK {i}" for i in range(MAX_MARKERS + 7)),
+            stdout="",
+        )
+        result = _extract_markers(logs, re.compile("MARK"))
+        assert result is not None
+        assert len(result) == MAX_MARKERS + 1
+        assert result[0] == "MARK 0"
+        assert result[-1] == "[7 additional matching lines omitted]"
 
 
 class TestCollectDumpFiles:

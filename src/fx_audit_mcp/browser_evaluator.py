@@ -18,11 +18,13 @@ from prefpicker import PrefPicker
 from sapphire import Sapphire
 
 from .models import BrowserCrashInfo, Logs
+from .site_server import SiteServer
 
 if TYPE_CHECKING:
     from grizzly.common.report import Report
 
 MAX_LOG_SIZE = 1_048_576  # bytes; logs are tail-truncated to this limit
+MAX_MARKERS = 200  # marker lines returned; the excess collapses into a sentinel
 IGNORED_SIGNATURES_DIR = Path(__file__).parent / "ignored_signatures"
 
 # Suppress grizzly's verbose logging (but allow CRITICAL and ERROR)
@@ -59,6 +61,16 @@ _BASELINE_PREFS: dict[str, str | int | bool] = {
     "messaging-system.log": "off",
     "services.settings.loglevel": "off",
     "services.settings.server": "data:,#remote-settings-dummy/v1",
+}
+
+# Extra prefs applied (under caller-supplied prefs) whenever sites_docroot
+# hosting is active: the sites are http-only and multi-window choreography is
+# their core use case, so skip the HTTPS-First upgrade/downgrade bounce on
+# http://*.site navigations and don't popup-block window.open without user
+# activation.
+_SITES_PREFS: dict[str, str | int | bool] = {
+    "dom.disable_open_during_load": False,
+    "dom.security.https_first": False,
 }
 
 
@@ -106,6 +118,61 @@ def _crashed_parent(parent_pid: int | None, crashdata: str) -> bool:
     """Return True when the ASAN crashdata PID matches the known parent PID."""
     crash_pid = _extract_crash_pid(crashdata)
     return parent_pid is not None and crash_pid is not None and crash_pid == parent_pid
+
+
+def _merged_prefs(
+    prefs: dict[str, str | int | bool] | None,
+    pac_url: str | None,
+) -> dict[str, str | int | bool]:
+    """Merge baseline, sites-default, caller, and PAC prefs in that order.
+
+    Args:
+        prefs: Caller-supplied prefs; override the baseline and the sites
+            defaults.
+        pac_url: Site server PAC URL when cross-origin hosting is active;
+            forces the proxy autoconfig pref (it must match this run's
+            server port, so it wins over any caller-supplied value).
+
+    Returns:
+        The effective pref dict for the run.
+    """
+    merged: dict[str, str | int | bool] = dict(_BASELINE_PREFS)
+    if pac_url is not None:
+        merged.update(_SITES_PREFS)
+    if prefs:
+        merged.update(prefs)
+    if pac_url is not None:
+        merged["network.proxy.autoconfig_url"] = pac_url
+    return merged
+
+
+def _extract_markers(logs: Logs, pattern: re.Pattern[str] | None) -> list[str] | None:
+    """Return stderr/stdout log lines matching *pattern*.
+
+    Args:
+        logs: Captured logs to scan.
+        pattern: Compiled regex applied to each line with ``search``, or None
+            when no marker extraction was requested.
+
+    Returns:
+        None when *pattern* is None; otherwise matching lines in original
+        order, stderr lines before stdout lines (may be empty). At most
+        MAX_MARKERS lines are returned; the excess collapses into a final
+        omitted-count sentinel.
+    """
+    if pattern is None:
+        return None
+    matches = [
+        line
+        for text in (logs.stderr, logs.stdout)
+        for line in text.splitlines()
+        if pattern.search(line)
+    ]
+    if len(matches) > MAX_MARKERS:
+        omitted = len(matches) - MAX_MARKERS
+        del matches[MAX_MARKERS:]
+        matches.append(f"[{omitted} additional matching lines omitted]")
+    return matches
 
 
 def _collect_dump_files(dump_dir: Path) -> dict[str, str]:
@@ -220,9 +287,7 @@ async def package_testcase(
                 required=is_entry,
             )
 
-        merged_prefs: dict[str, str | int | bool] = dict(_BASELINE_PREFS)
-        if prefs:
-            merged_prefs.update(prefs)
+        merged_prefs = _merged_prefs(prefs, None)
 
         assets_dir = Path(tempfile.mkdtemp(prefix="fx_audit_assets_"))
         prefs_path = assets_dir / "prefs.js"
@@ -252,6 +317,8 @@ async def browser_evaluator(  # pragma: no cover
     firefox_binary: Path,
     timeout: int = 30,
     prefs: dict[str, str | int | bool] | None = None,
+    sites_docroot: Path | None = None,
+    marker_regex: str | None = None,
 ) -> BrowserCrashInfo:
     """Reproduce a Firefox crash by running an HTML/JS testcase under
     ASAN-instrumented Firefox and reporting any crash detected.
@@ -267,6 +334,25 @@ async def browser_evaluator(  # pragma: no cover
     The ``prefs`` argument is merged on top of a hardened baseline of Firefox
     prefs; caller-supplied values override the baseline.
 
+    When ``sites_docroot`` is given, a built-in static server hosts that
+    directory at ``http://example.site/``, ``http://victim.site/`` and
+    ``http://attacker.site/`` for the duration of the run — three distinct
+    origins for same-origin-policy purposes (http only), all serving the
+    same docroot. A ``<filename>^headers^`` sidecar next to a file sets
+    custom response headers (one ``Name: value`` per line; optional first
+    line ``HTTP <status>`` overrides the status). The required
+    ``network.proxy.autoconfig_url`` pref is injected automatically and
+    overrides any caller-supplied value; ``localhost`` stays direct and all
+    other hosts remain blackholed. Sites runs also default
+    ``dom.security.https_first`` and ``dom.disable_open_during_load`` to
+    false (no HTTPS-First bounce on the http-only sites, no popup blocking)
+    — unlike the PAC, caller-supplied prefs override these.
+
+    When ``marker_regex`` is given, every captured stderr/stdout line
+    matching it is returned in ``markers`` — a semantic success oracle for
+    attacks that do not crash (e.g. lines printed by instrumentation in a
+    patched process).
+
     Ignored-signature matches (loaded from ``ignored_signatures/``) are
     filtered out before this returns. Captured logs are tail-truncated to
     MAX_LOG_SIZE. On crash, the dumped testcase directory contents are
@@ -279,9 +365,20 @@ async def browser_evaluator(  # pragma: no cover
         firefox_binary: Absolute path to the Firefox binary.
         timeout: Per-run timeout in seconds before closing the browser.
         prefs: Optional custom Firefox prefs to layer on top of the baseline.
+        sites_docroot: Optional directory (created if missing) to serve on the
+            built-in cross-origin sites; omit when the testcase needs no
+            extra origins.
+        marker_regex: Optional Python regex matched against each captured
+            stderr/stdout log line; matching lines are returned in
+            ``markers`` (first 200 matches; the excess collapses into a
+            final omitted-count sentinel — use a specific prefix, not a
+            broad pattern).
     """
     if not firefox_binary.exists():
         raise FileNotFoundError(f"Firefox binary not found at {firefox_binary}")
+
+    # Validate the regex before doing any expensive work.
+    marker_pattern = re.compile(marker_regex) if marker_regex is not None else None
 
     testcase = TestCase(
         entry_point=filename,
@@ -309,26 +406,36 @@ async def browser_evaluator(  # pragma: no cover
     # Minimize log spam from mesa
     target.environ["EGL_LOG_LEVEL"] = "fatal"
 
-    # Always generate prefs.js from prefpicker template with hardcoded
-    # baseline prefs, plus any user-supplied custom prefs on top.
-    # These are set on the target profile (not the testcase) so they
-    # don't appear in testcase dump output.
-    merged_prefs = {**_BASELINE_PREFS, **prefs} if prefs else _BASELINE_PREFS
-    with tempfile.TemporaryDirectory(prefix="fx_audit_prefs_") as prefs_dir:
-        prefs_path = Path(prefs_dir) / "prefs.js"
-        template = PrefPicker.lookup_template("browser-fuzzing.yml")
-        assert template is not None
-        PrefPicker.load_template(template).create_prefsjs(
-            prefs_path,
-            additional_prefs=merged_prefs,
-        )
-        target.asset_mgr.add("prefs", prefs_path)
-
-    # Process assets (prefs, etc.) - required for Firefox to launch properly
-    target.process_assets()
-
+    site_server: SiteServer | None = None
     results = []
     try:
+        # Host sites_docroot on the cross-origin sites for the duration of
+        # the run; the PAC pref below routes the site hosts to it. Created
+        # inside the try so a failure anywhere below still closes it.
+        if sites_docroot is not None:
+            site_server = SiteServer(sites_docroot)
+
+        # Always generate prefs.js from prefpicker template with hardcoded
+        # baseline prefs, plus any user-supplied custom prefs on top.
+        # These are set on the target profile (not the testcase) so they
+        # don't appear in testcase dump output.
+        merged_prefs = _merged_prefs(
+            prefs, site_server.pac_url if site_server is not None else None
+        )
+        with tempfile.TemporaryDirectory(prefix="fx_audit_prefs_") as prefs_dir:
+            prefs_path = Path(prefs_dir) / "prefs.js"
+            template = PrefPicker.lookup_template("browser-fuzzing.yml")
+            assert template is not None
+            PrefPicker.load_template(template).create_prefsjs(
+                prefs_path,
+                additional_prefs=merged_prefs,
+            )
+            target.asset_mgr.add("prefs", prefs_path)
+
+        # Process assets (prefs, etc.) - required for Firefox to launch
+        # properly
+        target.process_assets()
+
         with Sapphire(auto_close=1) as server:
             target.reverse(server.port, server.port)
             with ReplayManager(
@@ -358,6 +465,7 @@ async def browser_evaluator(  # pragma: no cover
                             ),
                             files={},
                             logs=logs,
+                            markers=_extract_markers(logs, marker_pattern),
                             message="Crash detected",
                         )
                     return BrowserCrashInfo(
@@ -367,19 +475,22 @@ async def browser_evaluator(  # pragma: no cover
                             "check logs for the underlying cause"
                         ),
                         logs=logs,
+                        markers=_extract_markers(logs, marker_pattern),
                     )
 
         if not results:
             with tempfile.TemporaryDirectory(prefix="fx_audit_logs_") as log_dir_str:
                 log_dir = Path(log_dir_str)
                 target.save_logs(log_dir)
+                logs = read_grizzly_logs(log_dir)
                 return BrowserCrashInfo(
                     crashed=False,
                     message=(
                         "No crash detected - check logs for clues "
                         "about why the testcase didn't trigger the vulnerability"
                     ),
-                    logs=read_grizzly_logs(log_dir),
+                    logs=logs,
+                    markers=_extract_markers(logs, marker_pattern),
                 )
 
         result_obj = results[0]
@@ -393,6 +504,7 @@ async def browser_evaluator(  # pragma: no cover
                 crashed_parent=_crashed_parent(target.parent_pid, logs.crashdata),
                 files=_collect_dump_files(dump_dir),
                 logs=logs,
+                markers=_extract_markers(logs, marker_pattern),
                 message="Crash detected",
             )
 
@@ -401,5 +513,7 @@ async def browser_evaluator(  # pragma: no cover
         if target.launch_timeout_report is not None:
             target.launch_timeout_report.cleanup()
         target.cleanup()
+        if site_server is not None:
+            site_server.close()
         for result_obj in results:
             result_obj.report.cleanup()

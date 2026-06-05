@@ -56,6 +56,16 @@ class BrowserCrashInfo(ToolModel):
         default=None,
         description="stderr/stdout/crashdata captured from Firefox.",
     )
+    markers: list[str] | None = Field(
+        default=None,
+        description=(
+            "Captured log lines matching the marker_regex argument, in order "
+            "(stderr lines before stdout lines). Empty list if a marker_regex "
+            "was given but nothing matched; None when none was given. Long "
+            "lists are truncated with a trailing omitted-count sentinel."
+        ),
+        examples=[["IPDLVERIFY PFoo-h1 step=2 got victim value"]],
+    )
 
 
 class JSShellCrashInfo(ToolModel):
