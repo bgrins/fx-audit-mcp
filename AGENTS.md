@@ -11,6 +11,7 @@ src/fx_audit_mcp/          # Main package
   __init__.py                  # Public API re-exports
   models.py                    # Pydantic return types (BrowserCrashInfo, BuildResult, ...)
   browser_evaluator.py         # Run testcase in ASAN Firefox via grizzly
+  site_server.py               # Cross-origin static server for browser testcases
   js_shell_evaluator.py        # Run testcase in SpiderMonkey JS shell
   nss_gtest_evaluator.py       # Run NSS GTest under ASAN
   build_firefox.py             # Build Firefox with mach build
@@ -24,6 +25,7 @@ tests/                         # Unit tests (mirrors src layout by tool file)
   test_build_nss.py
   test_js_shell_evaluator.py
   test_nss_gtest_evaluator.py
+  test_site_server.py
 ```
 
 ## Key Design Patterns

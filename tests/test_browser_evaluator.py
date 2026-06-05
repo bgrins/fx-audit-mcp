@@ -8,11 +8,13 @@ from pathlib import Path
 import pytest
 
 from fx_audit_mcp.browser_evaluator import (
+    _BASELINE_PREFS,
     MAX_LOG_SIZE,
     _collect_dump_files,
     _crashed_parent,
     _extract_crash_pid,
     _load_ignored_signatures,
+    _merged_prefs,
     browser_evaluator,
     package_testcase,
     read_grizzly_logs,
@@ -125,6 +127,46 @@ class TestBrowserEvaluator:
                 filename="test.html",
                 firefox_binary=tmp_path / "no_firefox",
             )
+
+
+class TestMergedPrefs:
+    def test_baseline_only(self) -> None:
+        """Without sites or caller prefs, only the baseline is returned."""
+        merged = _merged_prefs(None, None)
+        assert merged == _BASELINE_PREFS
+        assert merged is not _BASELINE_PREFS
+
+    def test_sites_defaults_and_pac_injected(self) -> None:
+        """A PAC URL adds the http-friendly sites defaults and the PAC pref."""
+        merged = _merged_prefs(None, "data:,pac")
+        assert merged["dom.security.https_first"] is False
+        assert merged["dom.disable_open_during_load"] is False
+        assert merged["network.proxy.autoconfig_url"] == "data:,pac"
+
+    def test_no_sites_prefs_without_pac(self) -> None:
+        """Sites defaults are not applied when hosting is inactive."""
+        merged = _merged_prefs({"foo.bar": 1}, None)
+        assert "dom.security.https_first" not in merged
+        assert "network.proxy.autoconfig_url" not in merged
+        assert merged["foo.bar"] == 1
+
+    def test_caller_overrides_sites_defaults_but_not_pac(self) -> None:
+        """Caller prefs beat the sites defaults; the PAC always wins."""
+        merged = _merged_prefs(
+            {
+                "dom.security.https_first": True,
+                "network.proxy.autoconfig_url": "stale-pac",
+            },
+            "data:,pac",
+        )
+        assert merged["dom.security.https_first"] is True
+        assert merged["network.proxy.autoconfig_url"] == "data:,pac"
+
+    def test_baseline_not_mutated_by_caller_prefs(self) -> None:
+        """Overriding a baseline pref must not mutate the module constant."""
+        merged = _merged_prefs({"browser.backup.enabled": True}, None)
+        assert merged["browser.backup.enabled"] is True
+        assert _BASELINE_PREFS["browser.backup.enabled"] is False
 
 
 class TestCollectDumpFiles:

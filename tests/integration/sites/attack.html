@@ -1,0 +1,9 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>attack</title>
+<script>
+  console.log("IPDLVERIFY h1 attack loaded on " + location.host);
+  // Requires fuzzing.enabled=true. Crashing here proves attacker.site
+  // routed through the SiteServer docroot end-to-end.
+  FuzzingFunctions.crash("sites-hosting-e2e");
+</script>

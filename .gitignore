@@ -38,3 +38,6 @@ Thumbs.db
 # Coding Agents
 .codex
 .claude/
+
+# Local integration-test Firefox build (fetched via fuzzfetch)
+/firefox/
