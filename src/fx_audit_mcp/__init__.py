@@ -7,11 +7,14 @@ from .build_firefox import build_firefox
 from .build_nss import build_nss
 from .js_shell_evaluator import js_shell_evaluator
 from .nss_gtest_evaluator import nss_gtest_evaluator
+from .site_server import SiteServer, build_pac_url
 
 __all__ = [
+    "SiteServer",
     "browser_evaluator",
     "build_firefox",
     "build_nss",
+    "build_pac_url",
     "js_shell_evaluator",
     "nss_gtest_evaluator",
     "package_testcase",
