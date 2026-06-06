@@ -97,6 +97,38 @@ class _FxAuditFirefoxTarget(FirefoxTarget):
         if hasattr(self, "_puppet"):
             self.parent_pid = self._puppet.get_pid()
 
+    def live_log(self, log_id: str, offset: int) -> bytes:
+        """Read new bytes of a live browser log starting at *offset*.
+
+        Backs the SiteServer's ``/_output/`` endpoints, so in-page code can
+        observe markers mid-run. Safe to call from server threads at any
+        point in the target lifecycle: returns ``b""`` before launch, after
+        log cleanup, or on any read failure.
+
+        Args:
+            log_id: ffpuppet log id ("stderr" or "stdout").
+            offset: Byte offset to begin reading from.
+
+        Returns:
+            Log bytes from *offset* to the current end of log (may be empty).
+        """
+        puppet = getattr(self, "_puppet", None)
+        if puppet is None:
+            return b""
+        clone: Path | None = None
+        try:
+            if (puppet.log_length(log_id) or 0) <= offset:
+                return b""
+            clone = puppet.clone_log(log_id, offset=offset)
+            if clone is None:
+                return b""
+            return clone.read_bytes()
+        except OSError:
+            return b""
+        finally:
+            if clone is not None:
+                clone.unlink(missing_ok=True)
+
 
 def _extract_crash_pid(crashdata: str) -> int | None:
     """Extract the crashing process PID from ASAN output.
@@ -353,6 +385,14 @@ async def browser_evaluator(  # pragma: no cover
     attacks that do not crash (e.g. lines printed by instrumentation in a
     patched process).
 
+    Sites runs additionally expose the reserved ``/_output/`` namespace on
+    every site origin, backed by the live browser logs: ``/_output/lib.js``
+    (in-page helpers ``FxAudit.awaitMarker`` / ``FxAudit.awaitLog`` for
+    sequencing multi-step testcases without sleeps), ``/_output/markers``
+    (marker_regex-matching lines so far; requires ``marker_regex``), and
+    ``/_output/log?log=stderr&offset=N`` (raw log bytes from a byte
+    offset).
+
     Ignored-signature matches (loaded from ``ignored_signatures/``) are
     filtered out before this returns. Captured logs are tail-truncated to
     MAX_LOG_SIZE. On crash, the dumped testcase directory contents are
@@ -411,9 +451,15 @@ async def browser_evaluator(  # pragma: no cover
     try:
         # Host sites_docroot on the cross-origin sites for the duration of
         # the run; the PAC pref below routes the site hosts to it. Created
-        # inside the try so a failure anywhere below still closes it.
+        # inside the try so a failure anywhere below still closes it. The
+        # target's live logs back the /_output/ marker/log endpoints used
+        # for in-page sequencing.
         if sites_docroot is not None:
-            site_server = SiteServer(sites_docroot)
+            site_server = SiteServer(
+                sites_docroot,
+                log_reader=target.live_log,
+                marker_pattern=marker_pattern,
+            )
 
         # Always generate prefs.js from prefpicker template with hardcoded
         # baseline prefs, plus any user-supplied custom prefs on top.

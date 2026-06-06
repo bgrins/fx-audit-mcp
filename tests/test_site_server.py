@@ -1,6 +1,7 @@
 """Tests for the built-in cross-origin site server."""
 
 import http.client
+import re
 from collections.abc import Iterator
 from email.message import Message
 from pathlib import Path
@@ -10,11 +11,34 @@ import pytest
 from fx_audit_mcp.site_server import SITES, SiteServer, build_pac_url
 
 
+class _FakeLogs:
+    """In-memory stand-in for the live browser logs."""
+
+    def __init__(self) -> None:
+        self.data: dict[str, bytes] = {"stderr": b"", "stdout": b""}
+
+    def read(self, log_id: str, offset: int) -> bytes:
+        return self.data[log_id][offset:]
+
+
 @pytest.fixture(name="server")
 def server_fixture(tmp_path: Path) -> Iterator[SiteServer]:
     """Run a SiteServer on a temp docroot for the duration of a test."""
     server = SiteServer(tmp_path / "sites")
     yield server
+    server.close()
+
+
+@pytest.fixture(name="live")
+def live_fixture(tmp_path: Path) -> Iterator[tuple[SiteServer, _FakeLogs]]:
+    """Run a SiteServer with live-log endpoints backed by fake logs."""
+    logs = _FakeLogs()
+    server = SiteServer(
+        tmp_path / "sites",
+        log_reader=logs.read,
+        marker_pattern=re.compile("MARKER"),
+    )
+    yield server, logs
     server.close()
 
 
@@ -204,6 +228,132 @@ def test_docroot_created_if_missing(tmp_path: Path) -> None:
         assert server.docroot == docroot.resolve()
     finally:
         server.close()
+
+
+@pytest.mark.parametrize("site", SITES)
+def test_lib_js_served_on_every_site(
+    live: tuple[SiteServer, _FakeLogs], site: str
+) -> None:
+    """Verify the helper library is served on each site with CORS headers."""
+    server, _ = live
+    status, body, headers = _request(server, f"http://{site}/_output/lib.js")
+    assert status == 200
+    assert b"FxAudit" in body
+    assert b"awaitMarker" in body
+    assert b"awaitLog" in body
+    assert headers["Content-Type"] == "text/javascript"
+    assert headers["Access-Control-Allow-Origin"] == "*"
+    assert headers["Cross-Origin-Resource-Policy"] == "cross-origin"
+    assert headers["Cache-Control"] == "no-store"
+
+
+def test_markers_filters_and_accumulates(live: tuple[SiteServer, _FakeLogs]) -> None:
+    """Verify the markers endpoint returns matching lines, append-only."""
+    server, logs = live
+    logs.data["stderr"] = b"MARKER h1 armed\nunrelated noise\n"
+    status, body, headers = _request(server, "http://victim.site/_output/markers")
+    assert status == 200
+    assert body == b"MARKER h1 armed"
+    assert headers["Access-Control-Allow-Origin"] == "*"
+    assert headers["Cache-Control"] == "no-store"
+    logs.data["stderr"] += b"MARKER h1 step=client ok\n"
+    _, body, _ = _request(server, "http://victim.site/_output/markers")
+    assert body == b"MARKER h1 armed\nMARKER h1 step=client ok"
+
+
+def test_markers_partial_line_held_back(live: tuple[SiteServer, _FakeLogs]) -> None:
+    """Ensure a line without its newline is withheld until completed."""
+    server, logs = live
+    logs.data["stderr"] = b"MARKER partial"
+    _, body, _ = _request(server, "http://victim.site/_output/markers")
+    assert body == b""
+    logs.data["stderr"] += b" done\n"
+    _, body, _ = _request(server, "http://victim.site/_output/markers")
+    assert body == b"MARKER partial done"
+
+
+def test_markers_scans_both_logs(live: tuple[SiteServer, _FakeLogs]) -> None:
+    """Verify marker lines are collected from stderr and stdout."""
+    server, logs = live
+    logs.data["stderr"] = b"MARKER from stderr\n"
+    logs.data["stdout"] = b"MARKER from stdout\n"
+    _, body, _ = _request(server, "http://victim.site/_output/markers")
+    assert body == b"MARKER from stderr\nMARKER from stdout"
+
+
+def test_markers_404_without_configuration(server: SiteServer) -> None:
+    """Ensure the markers endpoint 404s when no marker pattern was given."""
+    status, _, _ = _request(server, "http://victim.site/_output/markers")
+    assert status == 404
+
+
+def test_log_endpoint_serves_bytes_from_offset(
+    live: tuple[SiteServer, _FakeLogs],
+) -> None:
+    """Verify raw log reads honor the offset and report X-Next-Offset."""
+    server, logs = live
+    logs.data["stderr"] = b"hello world"
+    status, body, headers = _request(server, "http://victim.site/_output/log")
+    assert status == 200
+    assert body == b"hello world"
+    assert headers["X-Next-Offset"] == "11"
+    assert headers["Access-Control-Expose-Headers"] == "X-Next-Offset"
+    _, body, headers = _request(
+        server, "http://victim.site/_output/log?log=stderr&offset=6"
+    )
+    assert body == b"world"
+    assert headers["X-Next-Offset"] == "11"
+    _, body, headers = _request(server, "http://victim.site/_output/log?offset=11")
+    assert body == b""
+    assert headers["X-Next-Offset"] == "11"
+
+
+@pytest.mark.parametrize(
+    "query", ["log=heap", "offset=abc", "offset=-1"], ids=["log", "nan", "negative"]
+)
+def test_log_endpoint_rejects_bad_params(
+    live: tuple[SiteServer, _FakeLogs], query: str
+) -> None:
+    """Ensure unknown log ids and bad offsets are rejected with 400."""
+    server, _ = live
+    status, _, _ = _request(server, f"http://victim.site/_output/log?{query}")
+    assert status == 400
+
+
+def test_log_endpoint_404_without_reader(server: SiteServer) -> None:
+    """Ensure the log endpoint 404s when no live-log reader was given."""
+    status, _, _ = _request(server, "http://victim.site/_output/log")
+    assert status == 404
+
+
+def test_output_namespace_not_served_from_docroot(
+    live: tuple[SiteServer, _FakeLogs],
+) -> None:
+    """Ensure docroot files can never shadow the reserved namespace."""
+    server, _ = live
+    shadow = server.docroot / "_output"
+    shadow.mkdir()
+    (shadow / "lib.js").write_text("fake", encoding="utf-8")
+    (shadow / "extra.html").write_text("fake", encoding="utf-8")
+    _, body, _ = _request(server, "http://victim.site/_output/lib.js")
+    assert body != b"fake"
+    status, _, _ = _request(server, "http://victim.site/_output/extra.html")
+    assert status == 404
+
+
+def test_output_options_preflight(live: tuple[SiteServer, _FakeLogs]) -> None:
+    """Verify the namespace answers CORS preflight permissively."""
+    server, _ = live
+    status, body, headers = _request(
+        server,
+        "http://victim.site/_output/markers",
+        method="OPTIONS",
+        headers={"Access-Control-Request-Method": "GET"},
+    )
+    assert status == 204
+    assert body == b""
+    assert headers["Access-Control-Allow-Origin"] == "*"
+    assert headers["Access-Control-Allow-Methods"] == "GET"
 
 
 def test_pac_url_property_embeds_port(server: SiteServer) -> None:

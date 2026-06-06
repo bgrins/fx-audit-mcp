@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from pytest_mock import MockerFixture
 
 from fx_audit_mcp.browser_evaluator import (
     _BASELINE_PREFS,
@@ -16,6 +17,7 @@ from fx_audit_mcp.browser_evaluator import (
     _crashed_parent,
     _extract_crash_pid,
     _extract_markers,
+    _FxAuditFirefoxTarget,
     _load_ignored_signatures,
     _merged_prefs,
     browser_evaluator,
@@ -262,6 +264,56 @@ _ASAN_CRASHDATA = "==4242==ERROR: AddressSanitizer: x"
 def test_crashed_parent(parent_pid: int | None, crashdata: str, expected: bool) -> None:
     """Verify that _crashed_parent returns True only when PIDs are known and match."""
     assert _crashed_parent(parent_pid, crashdata) is expected
+
+
+class TestLiveLog:
+    @staticmethod
+    def _target(puppet: object | None) -> _FxAuditFirefoxTarget:
+        """Build a target without running its (browser-launching) __init__."""
+        target = _FxAuditFirefoxTarget.__new__(_FxAuditFirefoxTarget)
+        if puppet is not None:
+            # The attribute live_log() reads really is grizzly's protected one.
+            target._puppet = puppet  # pylint: disable=protected-access
+        return target
+
+    def test_no_puppet_returns_empty(self) -> None:
+        """Return empty bytes before the browser target is launched."""
+        assert self._target(None).live_log("stderr", 0) == b""
+
+    def test_reads_clone_from_offset_and_unlinks(
+        self, mocker: MockerFixture, tmp_path: Path
+    ) -> None:
+        """Read the cloned log bytes and remove the clone afterwards."""
+        clone = tmp_path / "clone.txt"
+        clone.write_bytes(b"world")
+        puppet = mocker.MagicMock()
+        puppet.log_length.return_value = 11
+        puppet.clone_log.return_value = clone
+        assert self._target(puppet).live_log("stderr", 6) == b"world"
+        puppet.clone_log.assert_called_once_with("stderr", offset=6)
+        assert not clone.exists()
+
+    def test_offset_at_end_skips_clone(self, mocker: MockerFixture) -> None:
+        """Return empty bytes without cloning when nothing new was written."""
+        puppet = mocker.MagicMock()
+        puppet.log_length.return_value = 11
+        assert self._target(puppet).live_log("stderr", 11) == b""
+        puppet.clone_log.assert_not_called()
+
+    def test_missing_log_returns_empty(self, mocker: MockerFixture) -> None:
+        """Return empty bytes when ffpuppet reports no such log."""
+        puppet = mocker.MagicMock()
+        puppet.log_length.return_value = None
+        assert self._target(puppet).live_log("stderr", 0) == b""
+
+    def test_clone_failure_returns_empty(self, mocker: MockerFixture) -> None:
+        """Return empty bytes when cloning fails or the clone disappears."""
+        puppet = mocker.MagicMock()
+        puppet.log_length.return_value = 11
+        puppet.clone_log.return_value = None
+        assert self._target(puppet).live_log("stderr", 0) == b""
+        puppet.clone_log.side_effect = OSError("gone")
+        assert self._target(puppet).live_log("stderr", 0) == b""
 
 
 class TestIgnoredSignatures:
