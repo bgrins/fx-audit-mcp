@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import sys
 import tempfile
 from logging import ERROR, getLogger
@@ -23,8 +24,8 @@ from .site_server import SiteServer
 if TYPE_CHECKING:
     from grizzly.common.report import Report
 
-MAX_LOG_SIZE = 1_048_576  # bytes; logs are tail-truncated to this limit
-MAX_MARKERS = 200  # marker lines returned; the excess collapses into a sentinel
+MAX_LOG_SIZE = 1_048_576  # bytes; inline crashdata is tail-truncated to this
+STDERR_TAIL_SIZE = 16_384  # chars; inline stderr tail in BrowserCrashInfo
 IGNORED_SIGNATURES_DIR = Path(__file__).parent / "ignored_signatures"
 
 # Suppress grizzly's verbose logging (but allow CRITICAL and ERROR)
@@ -97,6 +98,38 @@ class _FxAuditFirefoxTarget(FirefoxTarget):
         if hasattr(self, "_puppet"):
             self.parent_pid = self._puppet.get_pid()
 
+    def live_log(self, log_id: str, offset: int) -> bytes:
+        """Read new bytes of a live browser log starting at *offset*.
+
+        Backs the SiteServer's ``/_output/`` endpoints, so in-page code can
+        observe log output mid-run. Safe to call from server threads at any
+        point in the target lifecycle: returns ``b""`` before launch, after
+        log cleanup, or on any read failure.
+
+        Args:
+            log_id: ffpuppet log id ("stderr" or "stdout").
+            offset: Byte offset to begin reading from.
+
+        Returns:
+            Log bytes from *offset* to the current end of log (may be empty).
+        """
+        puppet = getattr(self, "_puppet", None)
+        if puppet is None:
+            return b""
+        clone: Path | None = None
+        try:
+            if (puppet.log_length(log_id) or 0) <= offset:
+                return b""
+            clone = puppet.clone_log(log_id, offset=offset)
+            if clone is None:
+                return b""
+            return clone.read_bytes()
+        except OSError:
+            return b""
+        finally:
+            if clone is not None:
+                clone.unlink(missing_ok=True)
+
 
 def _extract_crash_pid(crashdata: str) -> int | None:
     """Extract the crashing process PID from ASAN output.
@@ -146,33 +179,16 @@ def _merged_prefs(
     return merged
 
 
-def _extract_markers(logs: Logs, pattern: re.Pattern[str] | None) -> list[str] | None:
-    """Return stderr/stdout log lines matching *pattern*.
+def _export_logs(log_dir: Path, output_dir: Path | None) -> None:
+    """Copy the complete log_*.txt files from *log_dir* into *output_dir*.
 
-    Args:
-        logs: Captured logs to scan.
-        pattern: Compiled regex applied to each line with ``search``, or None
-            when no marker extraction was requested.
-
-    Returns:
-        None when *pattern* is None; otherwise matching lines in original
-        order, stderr lines before stdout lines (may be empty). At most
-        MAX_MARKERS lines are returned; the excess collapses into a final
-        omitted-count sentinel.
+    The copies are untruncated, unlike the inline crashdata/stderr_tail
+    fields; no-op when no output_dir was requested.
     """
-    if pattern is None:
-        return None
-    matches = [
-        line
-        for text in (logs.stderr, logs.stdout)
-        for line in text.splitlines()
-        if pattern.search(line)
-    ]
-    if len(matches) > MAX_MARKERS:
-        omitted = len(matches) - MAX_MARKERS
-        del matches[MAX_MARKERS:]
-        matches.append(f"[{omitted} additional matching lines omitted]")
-    return matches
+    if output_dir is None:
+        return
+    for log_path in log_dir.glob("log_*.txt"):
+        shutil.copy2(log_path, output_dir / log_path.name)
 
 
 def _collect_dump_files(dump_dir: Path) -> dict[str, str]:
@@ -318,7 +334,7 @@ async def browser_evaluator(  # pragma: no cover
     timeout: int = 30,
     prefs: dict[str, str | int | bool] | None = None,
     sites_docroot: Path | None = None,
-    marker_regex: str | None = None,
+    output_dir: Path | None = None,
 ) -> BrowserCrashInfo:
     """Reproduce a Firefox crash by running an HTML/JS testcase under
     ASAN-instrumented Firefox and reporting any crash detected.
@@ -348,15 +364,26 @@ async def browser_evaluator(  # pragma: no cover
     false (no HTTPS-First bounce on the http-only sites, no popup blocking)
     — unlike the PAC, caller-supplied prefs override these.
 
-    When ``marker_regex`` is given, every captured stderr/stdout line
-    matching it is returned in ``markers`` — a semantic success oracle for
-    attacks that do not crash (e.g. lines printed by instrumentation in a
-    patched process).
+    When ``output_dir`` is given (created if missing), the complete,
+    untruncated run logs — ``log_stderr.txt``, ``log_stdout.txt``, and any
+    ASAN/crashdata files — are written there after every run (crash,
+    no-crash, and launch failure alike) for post-hoc searching (e.g. with
+    ``rg``); the resolved directory is returned in ``output_path``. A
+    directory already holding ``log_*.txt`` files is refused, so evidence
+    from different runs cannot mix — use a fresh directory per run.
+
+    Sites runs additionally expose ``/_output/log`` on every site origin,
+    backed by the live browser logs: ``?match=<substring>&cursor=N``
+    returns the first complete log line at/after byte ``cursor``
+    containing any ``match`` substring (no regex) as
+    ``<next-cursor>\\n<line>``, or an empty body when none yet — in-page
+    code polls it to sequence multi-step testcases without sleeps.
 
     Ignored-signature matches (loaded from ``ignored_signatures/``) are
-    filtered out before this returns. Captured logs are tail-truncated to
-    MAX_LOG_SIZE. On crash, the dumped testcase directory contents are
-    returned alongside the logs.
+    filtered out before this returns. Inline ``crashdata`` is
+    tail-truncated to MAX_LOG_SIZE and ``stderr_tail`` holds only the end
+    of stderr — the on-disk ``output_dir`` copies are complete. On crash,
+    the dumped testcase directory contents are returned in ``files``.
 
     Args:
         content: Testcase file contents as a string, not a path on disk.
@@ -368,17 +395,21 @@ async def browser_evaluator(  # pragma: no cover
         sites_docroot: Optional directory (created if missing) to serve on the
             built-in cross-origin sites; omit when the testcase needs no
             extra origins.
-        marker_regex: Optional Python regex matched against each captured
-            stderr/stdout log line; matching lines are returned in
-            ``markers`` (first 200 matches; the excess collapses into a
-            final omitted-count sentinel — use a specific prefix, not a
-            broad pattern).
+        output_dir: Optional directory to receive the complete run logs;
+            must not already contain ``log_*.txt`` files (use a fresh
+            directory per run, e.g. ``runs/run-1``).
     """
     if not firefox_binary.exists():
         raise FileNotFoundError(f"Firefox binary not found at {firefox_binary}")
 
-    # Validate the regex before doing any expensive work.
-    marker_pattern = re.compile(marker_regex) if marker_regex is not None else None
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = output_dir.resolve()
+        if any(output_dir.glob("log_*.txt")):
+            raise FileExistsError(
+                f"output_dir already contains log_*.txt files from a previous "
+                f"run: {output_dir} — use a fresh directory per run"
+            )
 
     testcase = TestCase(
         entry_point=filename,
@@ -411,9 +442,11 @@ async def browser_evaluator(  # pragma: no cover
     try:
         # Host sites_docroot on the cross-origin sites for the duration of
         # the run; the PAC pref below routes the site hosts to it. Created
-        # inside the try so a failure anywhere below still closes it.
+        # inside the try so a failure anywhere below still closes it. The
+        # target's live logs back the /_output/ endpoints used for in-page
+        # sequencing.
         if sites_docroot is not None:
-            site_server = SiteServer(sites_docroot)
+            site_server = SiteServer(sites_docroot, log_reader=target.live_log)
 
         # Always generate prefs.js from prefpicker template with hardcoded
         # baseline prefs, plus any user-supplied custom prefs on top.
@@ -454,6 +487,7 @@ async def browser_evaluator(  # pragma: no cover
                 except TargetLaunchTimeout:
                     if target.launch_timeout_report is None:
                         raise
+                    _export_logs(target.launch_timeout_report.path, output_dir)
                     logs = read_grizzly_logs(target.launch_timeout_report.path)
                     # A child process (content/GPU/etc.) can crash with ASAN
                     # while the parent stays alive and the bootstrap times out.
@@ -464,8 +498,9 @@ async def browser_evaluator(  # pragma: no cover
                                 target.parent_pid, logs.crashdata
                             ),
                             files={},
-                            logs=logs,
-                            markers=_extract_markers(logs, marker_pattern),
+                            crashdata=logs.crashdata,
+                            stderr_tail=logs.stderr[-STDERR_TAIL_SIZE:],
+                            output_path=str(output_dir) if output_dir else None,
                             message="Crash detected",
                         )
                     return BrowserCrashInfo(
@@ -474,14 +509,15 @@ async def browser_evaluator(  # pragma: no cover
                             "Firefox failed to launch within the timeout - "
                             "check logs for the underlying cause"
                         ),
-                        logs=logs,
-                        markers=_extract_markers(logs, marker_pattern),
+                        stderr_tail=logs.stderr[-STDERR_TAIL_SIZE:],
+                        output_path=str(output_dir) if output_dir else None,
                     )
 
         if not results:
             with tempfile.TemporaryDirectory(prefix="fx_audit_logs_") as log_dir_str:
                 log_dir = Path(log_dir_str)
                 target.save_logs(log_dir)
+                _export_logs(log_dir, output_dir)
                 logs = read_grizzly_logs(log_dir)
                 return BrowserCrashInfo(
                     crashed=False,
@@ -489,8 +525,8 @@ async def browser_evaluator(  # pragma: no cover
                         "No crash detected - check logs for clues "
                         "about why the testcase didn't trigger the vulnerability"
                     ),
-                    logs=logs,
-                    markers=_extract_markers(logs, marker_pattern),
+                    stderr_tail=logs.stderr[-STDERR_TAIL_SIZE:],
+                    output_path=str(output_dir) if output_dir else None,
                 )
 
         result_obj = results[0]
@@ -498,13 +534,15 @@ async def browser_evaluator(  # pragma: no cover
         with tempfile.TemporaryDirectory(prefix="fx_audit_dump_") as dump_dir_str:
             dump_dir = Path(dump_dir_str)
             testcase.dump(dump_dir, include_details=True)
+            _export_logs(report.path, output_dir)
             logs = read_grizzly_logs(report.path)
             return BrowserCrashInfo(
                 crashed=True,
                 crashed_parent=_crashed_parent(target.parent_pid, logs.crashdata),
                 files=_collect_dump_files(dump_dir),
-                logs=logs,
-                markers=_extract_markers(logs, marker_pattern),
+                crashdata=logs.crashdata,
+                stderr_tail=logs.stderr[-STDERR_TAIL_SIZE:],
+                output_path=str(output_dir) if output_dir else None,
                 message="Crash detected",
             )
 

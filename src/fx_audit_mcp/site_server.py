@@ -6,21 +6,40 @@ Firefox is pointed at a PAC (proxy auto-config) that routes requests for
 these hosts to this server, which answers the resulting proxy-form HTTP
 requests from a shared static docroot. Every other host keeps routing to a
 dead-end proxy, preserving the fuzzing prefs' network isolation.
+
+Besides the static docroot, every site exposes one reserved endpoint
+(never served from the docroot) backed by the live browser logs of the
+current run: ``/_output/log?match=<substring>&cursor=N``. It returns the
+first complete log line at/after byte ``cursor`` containing any of the
+given ``match`` substrings (no regex), as ``<next-cursor>\\n<line>`` —
+pass the new cursor back to consume the match. An empty body means no
+match yet. In-page testcase code polls this to sequence multi-step
+attacks without wall-clock sleeps.
 """
 
 import logging
 import mimetypes
 import threading
 import traceback
+from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 logger = logging.getLogger(__name__)
 
+# Reads (log_id, byte offset) and returns the new log bytes from there.
+LiveLogReader = Callable[[str, int], bytes]
+
 SITES: tuple[str, ...] = ("example.site", "victim.site", "attacker.site")
+
+# Reserved top-level URL namespace for the live log endpoint.
+OUTPUT_PREFIX = "_output"
+
+# Log ids the live endpoint may read.
+_LIVE_LOG_IDS: tuple[str, ...] = ("stderr", "stdout")
 
 # Dead-end proxy used by the prefpicker browser-fuzzing template to blackhole
 # non-localhost traffic; hosts other than SITES keep routing here.
@@ -79,8 +98,93 @@ class _SiteRequestHandler(BaseHTTPRequestHandler):
             return None
         return file_path
 
+    def _serve_output_log(self, send_body: bool) -> None:
+        """Serve the next matching live-log line for ``/_output/log``.
+
+        Query params: one or more ``match=<needle>`` (plain substring, no
+        regex) and the ``cursor`` returned by the previous response
+        (default 0), plus optional ``log=stderr|stdout``. Scans complete
+        lines from ``cursor``; on a hit the body is
+        ``<next-cursor>\\n<matched line>`` — passing the new cursor back
+        consumes the match. An empty body means no match yet; the cursor
+        is then unchanged, so unmatched lines stay visible to later calls
+        with different needles. A trailing line without its newline is
+        never matched (it is still being written).
+
+        ``Access-Control-Allow-Origin: *`` lets the localhost entry
+        testcase use the endpoint cross-origin; sites pages are
+        same-origin and need nothing.
+        """
+        assert isinstance(self.server, _SiteHTTPServer)
+        reader = self.server.log_reader
+        if reader is None:
+            self.send_error(
+                HTTPStatus.NOT_FOUND, "log endpoint requires a live browser run"
+            )
+            return
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        log_id = query.get("log", ["stderr"])[-1]
+        if log_id not in _LIVE_LOG_IDS:
+            self.send_error(HTTPStatus.BAD_REQUEST, f"unknown log: {log_id!r}")
+            return
+        try:
+            cursor = int(query.get("cursor", ["0"])[-1])
+        except ValueError:
+            cursor = -1
+        if cursor < 0:
+            self.send_error(
+                HTTPStatus.BAD_REQUEST, "cursor must be a non-negative integer"
+            )
+            return
+        needles = query.get("match", [])
+        if not needles or any(not needle for needle in needles):
+            self.send_error(
+                HTTPStatus.BAD_REQUEST,
+                "at least one non-empty match=<substring> param is required",
+            )
+            return
+        body = b""
+        data = reader(log_id, cursor)
+        pos = 0
+        while (end := data.find(b"\n", pos)) != -1:
+            line = data[pos:end].decode("utf-8", "replace")
+            if any(needle in line for needle in needles):
+                body = f"{cursor + end + 1}\n{line}".encode()
+                break
+            pos = end + 1
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        if send_body:
+            self.wfile.write(body)
+
+    def _maybe_serve_output(self, send_body: bool) -> bool:
+        """Serve the ``/_output/`` namespace; return True when handled.
+
+        The namespace is reserved: it is checked before docroot resolution,
+        so docroot files can never shadow (or be shadowed into) it.
+        """
+        assert isinstance(self.server, _SiteHTTPServer)
+        host, url_path = self._resolve_host_and_path()
+        relative = unquote(url_path).lstrip("/")
+        if not relative.startswith(f"{OUTPUT_PREFIX}/"):
+            return False
+        if host not in SITES:
+            self.send_error(HTTPStatus.BAD_GATEWAY, f"Unknown host: {host!r}")
+            return True
+        if relative.removeprefix(f"{OUTPUT_PREFIX}/") == "log":
+            self._serve_output_log(send_body)
+        else:
+            self.send_error(HTTPStatus.NOT_FOUND)
+        return True
+
     def _serve(self, send_body: bool) -> None:
-        """Map the request to a docroot file and send the response."""
+        """Map the request to an output endpoint or docroot file and respond."""
+        if self._maybe_serve_output(send_body):
+            return
         file_path = self._resolve_file()
         if file_path is None:
             return
@@ -155,12 +259,13 @@ class _SiteRequestHandler(BaseHTTPRequestHandler):
 
 
 class _SiteHTTPServer(ThreadingHTTPServer):
-    """Loopback HTTP server carrying the docroot for request handlers."""
+    """Loopback HTTP server carrying shared state for request handlers."""
 
     daemon_threads = True
 
-    def __init__(self, docroot: Path) -> None:
+    def __init__(self, docroot: Path, log_reader: LiveLogReader | None) -> None:
         self.docroot = docroot
+        self.log_reader = log_reader
         super().__init__(("127.0.0.1", 0), _SiteRequestHandler)
 
     def handle_error(self, request: object, client_address: object) -> None:
@@ -178,12 +283,21 @@ class SiteServer:
 
     Binds 127.0.0.1 on an ephemeral port and serves *docroot* (created if
     missing) on a daemon thread until ``close()`` is called.
+
+    When *log_reader* is given, the ``/_output/log`` endpoint serves the
+    live browser logs (see the module docstring); without it the endpoint
+    answers 404.
     """
 
-    def __init__(self, docroot: Path) -> None:
+    def __init__(
+        self,
+        docroot: Path,
+        *,
+        log_reader: LiveLogReader | None = None,
+    ) -> None:
         docroot.mkdir(parents=True, exist_ok=True)
         self.docroot = docroot.resolve()
-        self._httpd = _SiteHTTPServer(self.docroot)
+        self._httpd = _SiteHTTPServer(self.docroot, log_reader)
         self._thread = threading.Thread(
             target=self._httpd.serve_forever, name="site-server", daemon=True
         )

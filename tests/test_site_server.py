@@ -10,11 +10,30 @@ import pytest
 from fx_audit_mcp.site_server import SITES, SiteServer, build_pac_url
 
 
+class _FakeLogs:
+    """In-memory stand-in for the live browser logs."""
+
+    def __init__(self) -> None:
+        self.data: dict[str, bytes] = {"stderr": b"", "stdout": b""}
+
+    def read(self, log_id: str, offset: int) -> bytes:
+        return self.data[log_id][offset:]
+
+
 @pytest.fixture(name="server")
 def server_fixture(tmp_path: Path) -> Iterator[SiteServer]:
     """Run a SiteServer on a temp docroot for the duration of a test."""
     server = SiteServer(tmp_path / "sites")
     yield server
+    server.close()
+
+
+@pytest.fixture(name="live")
+def live_fixture(tmp_path: Path) -> Iterator[tuple[SiteServer, _FakeLogs]]:
+    """Run a SiteServer with live-log endpoints backed by fake logs."""
+    logs = _FakeLogs()
+    server = SiteServer(tmp_path / "sites", log_reader=logs.read)
+    yield server, logs
     server.close()
 
 
@@ -204,6 +223,117 @@ def test_docroot_created_if_missing(tmp_path: Path) -> None:
         assert server.docroot == docroot.resolve()
     finally:
         server.close()
+
+
+@pytest.mark.parametrize("site", SITES)
+def test_log_match_first_line_and_cursor(
+    live: tuple[SiteServer, _FakeLogs], site: str
+) -> None:
+    """Verify match returns the first matching line plus a consume cursor."""
+    server, logs = live
+    logs.data["stderr"] = b"noise\nMARK one\nMARK two\n"
+    status, body, headers = _request(server, f"http://{site}/_output/log?match=MARK")
+    assert status == 200
+    # next-cursor points just past "noise\nMARK one\n".
+    assert body == b"15\nMARK one"
+    assert headers["Access-Control-Allow-Origin"] == "*"
+    assert headers["Cache-Control"] == "no-store"
+    assert "X-Next-Offset" not in headers
+
+
+def test_log_match_cursor_consumes(live: tuple[SiteServer, _FakeLogs]) -> None:
+    """Verify passing the returned cursor back yields the next match."""
+    server, logs = live
+    logs.data["stderr"] = b"MARK one\nMARK two\n"
+    _, body, _ = _request(server, "http://victim.site/_output/log?match=MARK")
+    assert body == b"9\nMARK one"
+    _, body, _ = _request(server, "http://victim.site/_output/log?match=MARK&cursor=9")
+    assert body == b"18\nMARK two"
+    _, body, _ = _request(server, "http://victim.site/_output/log?match=MARK&cursor=18")
+    assert body == b""
+
+
+def test_log_match_multiple_needles_or(live: tuple[SiteServer, _FakeLogs]) -> None:
+    """Verify multiple match params act as OR, first hit wins."""
+    server, logs = live
+    logs.data["stderr"] = b"step=attack ERROR rv=0x80004005\nstep=attack ok\n"
+    _, body, _ = _request(
+        server,
+        "http://victim.site/_output/log?match=step%3Dattack%20ok"
+        "&match=step%3Dattack%20ERROR",
+    )
+    assert body.split(b"\n", 1)[1] == b"step=attack ERROR rv=0x80004005"
+
+
+def test_log_match_is_literal_not_regex(live: tuple[SiteServer, _FakeLogs]) -> None:
+    """Ensure needles match literally; regex metacharacters have no power."""
+    server, logs = live
+    logs.data["stderr"] = b"axb(c)\na.b(c)\n"
+    _, body, _ = _request(
+        server, "http://victim.site/_output/log?match=" + "a.b(c)".replace("(", "%28")
+    )
+    assert body.split(b"\n", 1)[1] == b"a.b(c)"
+
+
+def test_log_match_no_match_keeps_cursor(live: tuple[SiteServer, _FakeLogs]) -> None:
+    """Verify an unmatched poll returns an empty body (cursor unchanged)."""
+    server, logs = live
+    logs.data["stderr"] = b"nothing relevant\n"
+    status, body, _ = _request(server, "http://victim.site/_output/log?match=MARK")
+    assert status == 200
+    assert body == b""
+
+
+def test_log_match_partial_line_held_back(live: tuple[SiteServer, _FakeLogs]) -> None:
+    """Ensure a line still missing its newline is never matched."""
+    server, logs = live
+    logs.data["stderr"] = b"MARK partial"
+    _, body, _ = _request(server, "http://victim.site/_output/log?match=MARK")
+    assert body == b""
+    logs.data["stderr"] += b"!\n"
+    _, body, _ = _request(server, "http://victim.site/_output/log?match=MARK")
+    assert body == b"14\nMARK partial!"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "match=MARK&log=heap",
+        "match=MARK&cursor=abc",
+        "match=MARK&cursor=-1",
+        "",
+        "match=",
+    ],
+    ids=["log", "nan", "negative", "no-match", "empty-match"],
+)
+def test_log_endpoint_rejects_bad_params(
+    live: tuple[SiteServer, _FakeLogs], query: str
+) -> None:
+    """Ensure bad log ids, cursors, and missing/empty needles are 400s."""
+    server, _ = live
+    status, _, _ = _request(server, f"http://victim.site/_output/log?{query}")
+    assert status == 400
+
+
+def test_log_endpoint_404_without_reader(server: SiteServer) -> None:
+    """Ensure the log endpoint 404s when no live-log reader was given."""
+    status, _, _ = _request(server, "http://victim.site/_output/log?match=MARK")
+    assert status == 404
+
+
+def test_output_namespace_not_served_from_docroot(
+    live: tuple[SiteServer, _FakeLogs],
+) -> None:
+    """Ensure docroot files can never shadow the reserved namespace."""
+    server, _ = live
+    shadow = server.docroot / "_output"
+    shadow.mkdir()
+    (shadow / "log").write_text("fake", encoding="utf-8")
+    (shadow / "extra.html").write_text("fake", encoding="utf-8")
+    _, body, _ = _request(server, "http://victim.site/_output/log?match=MARK")
+    assert body != b"fake"
+    status, _, _ = _request(server, "http://victim.site/_output/extra.html")
+    assert status == 404
 
 
 def test_pac_url_property_embeds_port(server: SiteServer) -> None:

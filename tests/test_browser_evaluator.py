@@ -2,20 +2,20 @@
 
 import asyncio
 import json
-import re
 import sys
 from pathlib import Path
 
 import pytest
+from pytest_mock import MockerFixture
 
 from fx_audit_mcp.browser_evaluator import (
     _BASELINE_PREFS,
     MAX_LOG_SIZE,
-    MAX_MARKERS,
     _collect_dump_files,
     _crashed_parent,
+    _export_logs,
     _extract_crash_pid,
-    _extract_markers,
+    _FxAuditFirefoxTarget,
     _load_ignored_signatures,
     _merged_prefs,
     browser_evaluator,
@@ -132,16 +132,19 @@ class TestBrowserEvaluator:
             )
 
     @pytest.mark.anyio
-    async def test_invalid_marker_regex_fails_fast(self, tmp_path: Path) -> None:
-        """Verify an invalid marker_regex raises before launching Firefox."""
+    async def test_dirty_output_dir_refused(self, tmp_path: Path) -> None:
+        """Refuse an output_dir holding logs from a previous run."""
         binary = tmp_path / "firefox"
         binary.touch()
-        with pytest.raises(re.error):
+        out = tmp_path / "run-1"
+        out.mkdir()
+        (out / "log_stderr.txt").write_text("stale")
+        with pytest.raises(FileExistsError, match="fresh directory"):
             await browser_evaluator(
                 content="<html></html>",
                 filename="test.html",
                 firefox_binary=binary,
-                marker_regex="(unclosed",
+                output_dir=out,
             )
 
 
@@ -185,39 +188,25 @@ class TestMergedPrefs:
         assert _BASELINE_PREFS["browser.backup.enabled"] is False
 
 
-class TestExtractMarkers:
-    def test_none_pattern_returns_none(self) -> None:
-        """Return None when no marker pattern was requested."""
-        logs = Logs(stderr="IPDLVERIFY x", stdout="")
-        assert _extract_markers(logs, None) is None
+class TestExportLogs:
+    def test_copies_only_log_files(self, tmp_path: Path) -> None:
+        """log_*.txt files are copied with their names; other files are not."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "log_stderr.txt").write_text("err")
+        (src / "log_ffp_asan_1234.txt").write_text("==1234==ERROR: x")
+        (src / "minidump.dmp").write_text("skip")
+        dest = tmp_path / "run-1"
+        dest.mkdir()
+        _export_logs(src, dest)
+        assert (dest / "log_stderr.txt").read_text() == "err"
+        assert (dest / "log_ffp_asan_1234.txt").read_text() == "==1234==ERROR: x"
+        assert not (dest / "minidump.dmp").exists()
 
-    def test_matches_stderr_before_stdout(self) -> None:
-        """Matching lines are returned in order, stderr before stdout."""
-        logs = Logs(
-            stderr="noise\nIPDLVERIFY step=1\nmore noise",
-            stdout="IPDLVERIFY step=2\nnoise",
-        )
-        assert _extract_markers(logs, re.compile(r"^IPDLVERIFY ")) == [
-            "IPDLVERIFY step=1",
-            "IPDLVERIFY step=2",
-        ]
-
-    def test_no_match_returns_empty_list(self) -> None:
-        """An empty list distinguishes no-matches from not-requested."""
-        logs = Logs(stderr="noise", stdout="noise")
-        assert _extract_markers(logs, re.compile("IPDLVERIFY")) == []
-
-    def test_capped_with_truncation_sentinel(self) -> None:
-        """Verify marker lists are capped and report the omitted count."""
-        logs = Logs(
-            stderr="\n".join(f"MARK {i}" for i in range(MAX_MARKERS + 7)),
-            stdout="",
-        )
-        result = _extract_markers(logs, re.compile("MARK"))
-        assert result is not None
-        assert len(result) == MAX_MARKERS + 1
-        assert result[0] == "MARK 0"
-        assert result[-1] == "[7 additional matching lines omitted]"
+    def test_none_output_dir_is_noop(self, tmp_path: Path) -> None:
+        """Without an output_dir nothing is copied anywhere."""
+        (tmp_path / "log_stderr.txt").write_text("err")
+        _export_logs(tmp_path, None)
 
 
 class TestCollectDumpFiles:
@@ -262,6 +251,56 @@ _ASAN_CRASHDATA = "==4242==ERROR: AddressSanitizer: x"
 def test_crashed_parent(parent_pid: int | None, crashdata: str, expected: bool) -> None:
     """Verify that _crashed_parent returns True only when PIDs are known and match."""
     assert _crashed_parent(parent_pid, crashdata) is expected
+
+
+class TestLiveLog:
+    @staticmethod
+    def _target(puppet: object | None) -> _FxAuditFirefoxTarget:
+        """Build a target without running its (browser-launching) __init__."""
+        target = _FxAuditFirefoxTarget.__new__(_FxAuditFirefoxTarget)
+        if puppet is not None:
+            # The attribute live_log() reads really is grizzly's protected one.
+            target._puppet = puppet  # pylint: disable=protected-access
+        return target
+
+    def test_no_puppet_returns_empty(self) -> None:
+        """Return empty bytes before the browser target is launched."""
+        assert self._target(None).live_log("stderr", 0) == b""
+
+    def test_reads_clone_from_offset_and_unlinks(
+        self, mocker: MockerFixture, tmp_path: Path
+    ) -> None:
+        """Read the cloned log bytes and remove the clone afterwards."""
+        clone = tmp_path / "clone.txt"
+        clone.write_bytes(b"world")
+        puppet = mocker.MagicMock()
+        puppet.log_length.return_value = 11
+        puppet.clone_log.return_value = clone
+        assert self._target(puppet).live_log("stderr", 6) == b"world"
+        puppet.clone_log.assert_called_once_with("stderr", offset=6)
+        assert not clone.exists()
+
+    def test_offset_at_end_skips_clone(self, mocker: MockerFixture) -> None:
+        """Return empty bytes without cloning when nothing new was written."""
+        puppet = mocker.MagicMock()
+        puppet.log_length.return_value = 11
+        assert self._target(puppet).live_log("stderr", 11) == b""
+        puppet.clone_log.assert_not_called()
+
+    def test_missing_log_returns_empty(self, mocker: MockerFixture) -> None:
+        """Return empty bytes when ffpuppet reports no such log."""
+        puppet = mocker.MagicMock()
+        puppet.log_length.return_value = None
+        assert self._target(puppet).live_log("stderr", 0) == b""
+
+    def test_clone_failure_returns_empty(self, mocker: MockerFixture) -> None:
+        """Return empty bytes when cloning fails or the clone disappears."""
+        puppet = mocker.MagicMock()
+        puppet.log_length.return_value = 11
+        puppet.clone_log.return_value = None
+        assert self._target(puppet).live_log("stderr", 0) == b""
+        puppet.clone_log.side_effect = OSError("gone")
+        assert self._target(puppet).live_log("stderr", 0) == b""
 
 
 class TestIgnoredSignatures:

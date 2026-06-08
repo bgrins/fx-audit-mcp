@@ -52,19 +52,25 @@ class BrowserCrashInfo(ToolModel):
         ),
         examples=[{"test.html": "<html>...</html>"}],
     )
-    logs: Logs | None = Field(
-        default=None,
-        description="stderr/stdout/crashdata captured from Firefox.",
+    crashdata: str = Field(
+        default="",
+        description="ASAN/UBSAN sanitizer output captured from the run.",
     )
-    markers: list[str] | None = Field(
+    stderr_tail: str = Field(
+        default="",
+        description=(
+            "Tail of the browser's stderr for quick triage; the complete "
+            "logs are on disk at output_path."
+        ),
+    )
+    output_path: str | None = Field(
         default=None,
         description=(
-            "Captured log lines matching the marker_regex argument, in order "
-            "(stderr lines before stdout lines). Empty list if a marker_regex "
-            "was given but nothing matched; None when none was given. Long "
-            "lists are truncated with a trailing omitted-count sentinel."
+            "Directory holding the complete, untruncated run logs "
+            "(log_stderr.txt, log_stdout.txt, ASAN files) — search it "
+            "post-hoc (e.g. rg). None when no output_dir was requested."
         ),
-        examples=[["IPDLVERIFY PFoo-h1 step=2 got victim value"]],
+        examples=["/work/verify/runs/run-1"],
     )
 
 
