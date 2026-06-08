@@ -1,0 +1,24 @@
+# Integration-test environment: runs the `-m integration` pytest suite
+# against a prebuilt mozilla-central ASAN fuzzing Firefox fetched at image
+# build time (see Dockerfile).
+#
+# Run from the repo root:
+#   docker compose -f tests/integration/docker-compose.yml run --build --rm integration
+
+services:
+  integration:
+    build:
+      context: ../..
+      dockerfile: tests/integration/Dockerfile
+    # mozilla-central publishes ASAN fuzzing builds for x86_64 only; on
+    # Apple Silicon this runs under Rosetta emulation.
+    platform: linux/amd64
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_PTRACE # Required for ASAN stack symbolization
+    shm_size: 2gb # Firefox uses /dev/shm heavily
+    tmpfs:
+      - /tmp:size=1g # Grizzly temp dirs

@@ -24,6 +24,9 @@ tests/                         # Unit tests (mirrors src layout by tool file)
   test_build_nss.py
   test_js_shell_evaluator.py
   test_nss_gtest_evaluator.py
+  integration/                 # Dockerized integration tests (real ASAN Firefox)
+    Dockerfile
+    docker-compose.yml
 ```
 
 ## Key Design Patterns
@@ -64,6 +67,25 @@ uv run pre-commit install
 ```bash
 uv run pytest
 uv run pre-commit run --all-files
+```
+
+### Integration Tests
+
+Tests marked `integration` are excluded by default and exercise a real ASAN
+Firefox. Run them self-contained via Docker (fetches a prebuilt
+mozilla-central ASAN fuzzing build with fuzzfetch at image build time):
+
+```bash
+docker compose -f tests/integration/docker-compose.yml run --build --rm integration
+```
+
+The container is x86_64-only (upstream build availability); results under
+emulation are unreliable.
+
+Or directly against a local ASAN fuzzing build:
+
+```bash
+FIREFOX_BINARY=/path/to/asan/firefox uv run pytest -m integration
 ```
 
 ### Tooling

@@ -2,22 +2,30 @@
 
 import asyncio
 import json
+import os
+import re
 import sys
 from pathlib import Path
 
 import pytest
+from psutil import NoSuchProcess
+from pytest_mock import MockerFixture
 
 from fx_audit_mcp.browser_evaluator import (
     MAX_LOG_SIZE,
     _collect_dump_files,
+    _crash_reports,
     _crashed_parent,
     _extract_crash_pid,
+    _gpu_process_restarts,
     _load_ignored_signatures,
+    _process_type_from_cmdline,
+    _record_child_process_types,
     browser_evaluator,
     package_testcase,
     read_grizzly_logs,
 )
-from fx_audit_mcp.models import Logs
+from fx_audit_mcp.models import CrashReport, Logs
 
 be_module = sys.modules["fx_audit_mcp.browser_evaluator"]
 
@@ -169,6 +177,302 @@ _ASAN_CRASHDATA = "==4242==ERROR: AddressSanitizer: x"
 def test_crashed_parent(parent_pid: int | None, crashdata: str, expected: bool) -> None:
     """Verify that _crashed_parent returns True only when PIDs are known and match."""
     assert _crashed_parent(parent_pid, crashdata) is expected
+
+
+@pytest.mark.parametrize(
+    ("cmdline", "expected"),
+    [
+        (["/b/firefox", "-contentproc", "-childID", "1", "42", "tab"], "content"),
+        (["/b/plugin-container", "-parentBuildID", "1", "2", "gpu"], "gpu"),
+        (["/b/plugin-container", "-parentBuildID", "1", "4", "rdd"], "rdd"),
+        (["/b/plugin-container", "-parentBuildID", "1", "1", "socket"], "socket"),
+        (["/b/plugin-container", "-sandboxingKind", "0", "6", "utility"], "utility"),
+        # Parent process: no trailing child type token.
+        (["/b/firefox", "-foreground"], None),
+        (["/b/firefox", "http://127.0.0.1:1234/test.html"], None),
+        # Non-Gecko helper processes.
+        (["/b/crashhelper", "26572", "pipe.26572"], None),
+        ([], None),
+    ],
+)
+def test_process_type_from_cmdline(cmdline: list[str], expected: str | None) -> None:
+    """Verify the trailing Gecko process type token maps to a type name."""
+    assert _process_type_from_cmdline(cmdline) == expected
+
+
+# Sanitizer report carrying its own argv (ASAN_OPTIONS=print_cmdline=true);
+# print_cmdline emits the args space-separated with a trailing space.
+_ASAN_GPU_REPORT = (
+    "==555==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000000\n"
+    "    #0 0x7f in mozilla::gfx::Foo()\n"
+    "SUMMARY: AddressSanitizer: SEGV\n"
+    "\n"
+    "Command: /b/plugin-container -parentBuildID 1 -prefsHandle 0:1 2 gpu \n"
+)
+_ASAN_PARENT_REPORT = (
+    "==4242==ERROR: AddressSanitizer: heap-use-after-free\n"
+    "SUMMARY: AddressSanitizer: heap-use-after-free\n"
+    "\n"
+    "Command: /b/firefox -no-remote http://127.0.0.1:1234/test.html \n"
+)
+_ASAN_NO_CMDLINE_REPORT = "==777==ERROR: AddressSanitizer: SEGV\nSUMMARY: x\n"
+
+
+def _simplify(
+    reports: list[CrashReport] | None,
+) -> list[tuple[str, int]] | None:
+    """Reduce CrashReports to (process_type, pid) tuples for assertions."""
+    if reports is None:
+        return None
+    return [(r.process_type, r.pid) for r in reports]
+
+
+class TestCrashReports:
+    @pytest.mark.parametrize(
+        ("parent_pid", "pid_types", "crashdata", "expected"),
+        [
+            # No ASAN PID marker at all.
+            (4242, {}, "Segmentation fault (core dumped)", None),
+            # Command: line in the report wins, no sampler data needed.
+            (4242, {}, _ASAN_GPU_REPORT, [("gpu", 555)]),
+            # Parent-style Command: line (no type token) falls back to the
+            # parent PID match.
+            (4242, {}, _ASAN_PARENT_REPORT, [("parent", 4242)]),
+            # No Command: line: parent PID match.
+            (777, {}, _ASAN_NO_CMDLINE_REPORT, [("parent", 777)]),
+            # No Command: line: sampled process-tree map.
+            (4242, {777: "rdd"}, _ASAN_NO_CMDLINE_REPORT, [("rdd", 777)]),
+            # Crash PID present but never attributed.
+            (4242, {888: "content"}, _ASAN_NO_CMDLINE_REPORT, [("unknown", 777)]),
+            # Unknown parent PID and nothing else to go on.
+            (None, {}, _ASAN_NO_CMDLINE_REPORT, [("unknown", 777)]),
+        ],
+    )
+    def test_attribution(
+        self,
+        parent_pid: int | None,
+        pid_types: dict[int, str],
+        crashdata: str,
+        expected: list[tuple[str, int]] | None,
+    ) -> None:
+        """Verify attribution priority: Command: line, parent PID, sampled map."""
+        assert _simplify(_crash_reports(parent_pid, pid_types, crashdata)) == expected
+
+    def test_multiple_reports_each_attributed(self) -> None:
+        """Concatenated reports from different processes are attributed
+        per-block; one report's Command: line must not bleed into another."""
+        crashdata = _ASAN_NO_CMDLINE_REPORT + _ASAN_GPU_REPORT
+        assert _simplify(_crash_reports(4242, {777: "content"}, crashdata)) == [
+            ("content", 777),
+            ("gpu", 555),
+        ]
+
+    def test_parent_and_child_crash_together(self) -> None:
+        """A run where both a child and the parent crash yields both reports."""
+        crashdata = _ASAN_GPU_REPORT + _ASAN_PARENT_REPORT
+        assert _simplify(_crash_reports(4242, {}, crashdata)) == [
+            ("gpu", 555),
+            ("parent", 4242),
+        ]
+
+    def test_error_summary_extracted(self) -> None:
+        """The report's header error line is carried on the CrashReport."""
+        reports = _crash_reports(4242, {}, _ASAN_GPU_REPORT)
+        assert reports is not None
+        assert reports[0].error == (
+            "AddressSanitizer: SEGV on unknown address 0x000000000000"
+        )
+
+
+@pytest.mark.parametrize(
+    ("parent_pid", "pid_types", "expected"),
+    [
+        # Browser never launched: the tree was never sampled.
+        (None, {}, None),
+        # No GPU process observed (e.g. GPU process disabled).
+        (4242, {10: "content"}, 0),
+        # Single GPU process for the whole run: no restarts.
+        (4242, {10: "content", 11: "gpu"}, 0),
+        # Three distinct GPU PIDs: two respawns.
+        (4242, {10: "gpu", 11: "content", 12: "gpu", 13: "gpu"}, 2),
+    ],
+)
+def test_gpu_process_restarts(
+    parent_pid: int | None, pid_types: dict[int, str], expected: int | None
+) -> None:
+    """Verify GPU respawn counting from the sampled pid -> type map."""
+    assert _gpu_process_restarts(parent_pid, pid_types) == expected
+
+
+class TestRecordChildProcessTypes:
+    def test_records_recognized_children(self, mocker: MockerFixture) -> None:
+        """Recognized Gecko children are recorded; helpers and vanished
+        processes are skipped."""
+        gpu = mocker.Mock(pid=10)
+        gpu.cmdline.return_value = ["/b/plugin-container", "-x", "2", "gpu"]
+        tab = mocker.Mock(pid=11)
+        tab.cmdline.return_value = ["/b/plugin-container", "-childID", "1", "tab"]
+        helper = mocker.Mock(pid=12)
+        helper.cmdline.return_value = ["/b/crashhelper", "26572"]
+        gone = mocker.Mock(pid=13)
+        gone.cmdline.side_effect = NoSuchProcess(13)
+        parent = mocker.patch.object(be_module, "Process")
+        parent.return_value.children.return_value = [gpu, tab, helper, gone]
+        pid_types: dict[int, str] = {}
+        _record_child_process_types(1, pid_types)
+        assert pid_types == {10: "gpu", 11: "content"}
+        parent.return_value.children.assert_called_once_with(recursive=True)
+
+    def test_existing_entries_kept_without_refetch(self, mocker: MockerFixture) -> None:
+        """Already-recorded PIDs are not re-queried, so dead children keep
+        their type across samples."""
+        child = mocker.Mock(pid=10)
+        child.cmdline.side_effect = AssertionError("must not be called")
+        parent = mocker.patch.object(be_module, "Process")
+        parent.return_value.children.return_value = [child]
+        pid_types = {10: "gpu"}
+        _record_child_process_types(1, pid_types)
+        assert pid_types == {10: "gpu"}
+
+    def test_parent_gone(self, mocker: MockerFixture) -> None:
+        """A vanished parent process leaves the map untouched."""
+        mocker.patch.object(be_module, "Process", side_effect=NoSuchProcess(1))
+        pid_types: dict[int, str] = {}
+        _record_child_process_types(1, pid_types)
+        assert not pid_types
+
+
+# MOZ_CRASH -> ASAN SEGV in whichever process hosts the document; needs the
+# fuzzing.enabled pref.
+_FUZZING_CRASH_HTML = """<!doctype html>
+<script>
+window.onload = () => { FuzzingFunctions.crash("attribution-check"); };
+</script>
+"""
+
+# Hard-kills the GPU process via the parent (#ifdef FUZZING); the delay lets
+# the sampler record the original GPU pid before it is replaced.
+_GPU_KILL_HTML = """<!doctype html>
+<script>
+window.onload = () => setTimeout(() => FuzzingFunctions.killGPUProcess(), 2000);
+</script>
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_no_crash_sampler_lifecycle_live() -> None:
+    """A clean run: the sampler ran (gpu_process_restarts is an int) and
+    the crash fields stay unset."""
+    binary = os.environ.get("FIREFOX_BINARY", "")
+    if not binary or not Path(binary).is_file():
+        pytest.skip("FIREFOX_BINARY not set or not present")
+    result = await browser_evaluator(
+        content="<html><body>no crash</body></html>",
+        filename="test.html",
+        firefox_binary=Path(binary),
+        # A no-crash verdict waits out the full window; keep it short — it
+        # only needs child processes to spawn plus a few sampler ticks.
+        timeout=10,
+    )
+    assert result.crashed is False
+    assert result.crashed_parent is None
+    assert result.crash_reports is None
+    assert result.gpu_process_restarts == 0
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_content_crash_attribution_live() -> None:
+    """A content-process crash is attributed via the report's Command: line.
+
+    Requires FIREFOX_BINARY pointing at an ASAN fuzzing build; run with:
+    FIREFOX_BINARY=... uv run pytest -m integration
+    """
+    binary = os.environ.get("FIREFOX_BINARY", "")
+    if not binary or not Path(binary).is_file():
+        pytest.skip("FIREFOX_BINARY not set or not present")
+    result = await browser_evaluator(
+        content=_FUZZING_CRASH_HTML,
+        filename="test.html",
+        firefox_binary=Path(binary),
+        timeout=90,
+        prefs={"fuzzing.enabled": True},
+    )
+    assert result.crashed is True
+    assert result.crashed_parent is False
+    assert result.crash_reports is not None
+    assert [r.process_type for r in result.crash_reports] == ["content"]
+    # An int (not None) proves the process-tree sampler ran.
+    assert result.gpu_process_restarts is not None
+    assert result.logs is not None
+    # The report PID links the attribution to its full stack in crashdata.
+    assert f"=={result.crash_reports[0].pid}==ERROR:" in result.logs.crashdata
+    command = re.search(r"^Command: (.+)$", result.logs.crashdata, re.MULTILINE)
+    assert command is not None, "print_cmdline did not reach the crash log"
+    assert command.group(1).split()[-1] == "tab"
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_parent_crash_attribution_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent-process crash is attributed via the parent-PID match.
+
+    MOZ_FORCE_DISABLE_E10S puts the testcase document in the parent, so
+    FuzzingFunctions.crash() crashes it; the parent's Command: line has no
+    child-type token, forcing the PID-match path.
+    """
+    binary = os.environ.get("FIREFOX_BINARY", "")
+    if not binary or not Path(binary).is_file():
+        pytest.skip("FIREFOX_BINARY not set or not present")
+    # Official builds honor the force-disable only when non-local
+    # connections are also disabled.
+    monkeypatch.setenv("MOZ_FORCE_DISABLE_E10S", "1")
+    monkeypatch.setenv("MOZ_DISABLE_NONLOCAL_CONNECTIONS", "1")
+    result = await browser_evaluator(
+        content=_FUZZING_CRASH_HTML,
+        filename="test.html",
+        firefox_binary=Path(binary),
+        timeout=90,
+        prefs={"fuzzing.enabled": True},
+    )
+    assert result.crashed is True
+    assert result.crashed_parent is True
+    assert result.crash_reports is not None
+    assert [r.process_type for r in result.crash_reports] == ["parent"]
+    assert result.logs is not None
+    assert f"=={result.crash_reports[0].pid}==ERROR:" in result.logs.crashdata
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_gpu_process_restart_detected_live() -> None:
+    """A silent GPU process death (no sanitizer log) surfaces as a restart.
+
+    The GPU process is default-off on Linux, so it is pref-forced;
+    killGPUProcess() leaves no crash data, so detection relies entirely on
+    the process-tree sampler seeing a second GPU pid.
+    """
+    binary = os.environ.get("FIREFOX_BINARY", "")
+    if not binary or not Path(binary).is_file():
+        pytest.skip("FIREFOX_BINARY not set or not present")
+    result = await browser_evaluator(
+        content=_GPU_KILL_HTML,
+        filename="test.html",
+        firefox_binary=Path(binary),
+        timeout=20,
+        prefs={
+            "fuzzing.enabled": True,
+            "layers.gpu-process.enabled": True,
+            "layers.gpu-process.force-enabled": True,
+        },
+    )
+    assert result.crashed is False
+    assert result.crash_reports is None
+    assert result.gpu_process_restarts == 1
+    assert "GPU process restarted" in result.message
 
 
 class TestIgnoredSignatures:
