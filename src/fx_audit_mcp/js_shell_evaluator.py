@@ -3,6 +3,7 @@
 import asyncio
 import os
 import signal
+import sys
 import tempfile
 from pathlib import Path
 
@@ -53,6 +54,17 @@ async def js_shell_evaluator(
             os.close(fd)
             testcase_path.write_text(content, encoding="utf-8")
 
+            # Fuzzfetched shells ship their .so/.dylib dependencies next to
+            # the binary without an rpath, so the binary's directory must be
+            # on the library search path.
+            lib_path_var = (
+                "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+            )
+            env = {**os.environ}
+            env[lib_path_var] = os.pathsep.join(
+                filter(None, (str(js_binary.parent), env.get(lib_path_var)))
+            )
+
             proc = await asyncio.create_subprocess_exec(
                 str(js_binary),
                 "--fuzzing-safe",
@@ -61,7 +73,7 @@ async def js_shell_evaluator(
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env={**os.environ},
+                env=env,
             )
             try:
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(

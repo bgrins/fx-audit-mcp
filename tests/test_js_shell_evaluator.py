@@ -1,5 +1,7 @@
 """Tests for js_shell_evaluator tool."""
 
+import os
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -22,6 +24,48 @@ def _mock_proc(
     proc.communicate = communicate or AsyncMock(return_value=(stdout, stderr))
     mocker.patch("asyncio.create_subprocess_exec", return_value=proc)
     return proc
+
+
+LIB_PATH_VAR = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+
+
+@pytest.mark.anyio
+async def test_binary_dir_prepended_to_library_path(
+    mocker: MockerFixture, js_binary: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shell's own directory leads the library path so bundled libs load."""
+    monkeypatch.setenv(LIB_PATH_VAR, "/existing/libs")
+    spawn = mocker.patch(
+        "asyncio.create_subprocess_exec",
+        return_value=mocker.AsyncMock(
+            returncode=0,
+            communicate=AsyncMock(return_value=(b"", b"")),
+        ),
+    )
+    await js_shell_evaluator("print(1)", js_binary)
+    env = spawn.call_args.kwargs["env"]
+    assert env[LIB_PATH_VAR].split(os.pathsep) == [
+        str(js_binary.parent),
+        "/existing/libs",
+    ]
+
+
+@pytest.mark.anyio
+async def test_library_path_has_no_trailing_entry_when_previously_unset(
+    mocker: MockerFixture, js_binary: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unset library path gets exactly the binary dir, no empty entry."""
+    monkeypatch.delenv(LIB_PATH_VAR, raising=False)
+    spawn = mocker.patch(
+        "asyncio.create_subprocess_exec",
+        return_value=mocker.AsyncMock(
+            returncode=0,
+            communicate=AsyncMock(return_value=(b"", b"")),
+        ),
+    )
+    await js_shell_evaluator("print(1)", js_binary)
+    env = spawn.call_args.kwargs["env"]
+    assert env[LIB_PATH_VAR] == str(js_binary.parent)
 
 
 @pytest.mark.anyio

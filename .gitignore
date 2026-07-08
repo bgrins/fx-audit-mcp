@@ -38,3 +38,7 @@ Thumbs.db
 # Coding Agents
 .codex
 .claude/
+
+# Fuzzfetched / local Firefox builds
+/firefox/
+/builds/

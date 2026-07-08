@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import tempfile
@@ -284,6 +285,7 @@ async def browser_evaluator(  # pragma: no cover
     firefox_binary: Path,
     timeout: int = 30,
     prefs: dict[str, str | int | bool] | None = None,
+    launch_timeout: int | None = None,
 ) -> BrowserCrashInfo:
     """Reproduce a Firefox crash by running an HTML/JS testcase under
     ASAN-instrumented Firefox and reporting any crash detected.
@@ -311,9 +313,15 @@ async def browser_evaluator(  # pragma: no cover
         firefox_binary: Absolute path to the Firefox binary.
         timeout: Per-run timeout in seconds before closing the browser.
         prefs: Optional custom Firefox prefs to layer on top of the baseline.
+        launch_timeout: Seconds to wait for the browser to start; ASAN Firefox
+            can take much longer than the default on slow hosts. Defaults to
+            the FX_AUDIT_LAUNCH_TIMEOUT environment variable, or 30.
     """
     if not firefox_binary.exists():
         raise FileNotFoundError(f"Firefox binary not found at {firefox_binary}")
+
+    if launch_timeout is None:
+        launch_timeout = int(os.environ.get("FX_AUDIT_LAUNCH_TIMEOUT", "30"))
 
     testcase = TestCase(
         entry_point=filename,
@@ -330,7 +338,7 @@ async def browser_evaluator(  # pragma: no cover
     target = _FxAuditFirefoxTarget(
         binary=firefox_binary,
         display_mode=display_mode,
-        launch_timeout=30,
+        launch_timeout=launch_timeout,
         log_limit=0,
         memory_limit=0,
     )
